@@ -62,10 +62,25 @@ jobs:
       - name: Read backend URL
         run: |
           aws eks update-kubeconfig --name cluster --region "$AWS_REGION"
-          BACKEND_HOST="$(kubectl get service backend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
-          test -n "$BACKEND_HOST"
-          echo "BACKEND_URL=http://$BACKEND_HOST" >> "$GITHUB_ENV"
-        working-directory: .
+
+          echo "Waiting for backend LoadBalancer..."
+
+          for i in {1..30}; do
+            BACKEND_HOST="$(kubectl get service backend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
+
+            if [ -n "$BACKEND_HOST" ]; then
+              echo "Backend hostname: $BACKEND_HOST"
+              echo "BACKEND_URL=http://$BACKEND_HOST" >> "$GITHUB_ENV"
+              exit 0
+            fi
+
+            echo "Attempt $i/30: LoadBalancer is still pending..."
+            sleep 10
+          done
+  
+          echo "ERROR: Backend LoadBalancer was not assigned."
+          kubectl describe service backend
+          exit 1
 
       - name: Build and push image
         run: |
