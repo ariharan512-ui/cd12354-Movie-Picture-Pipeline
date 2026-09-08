@@ -1,0 +1,100 @@
+name: Frontend Continuous Deployment
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "starter/frontend/**"
+      - ".github/workflows/frontend-cd.yaml"
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+
+defaults:
+  run:
+    working-directory: starter/frontend
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: starter/frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: starter/frontend/package-lock.json
+
+      - run: npm ci
+      - run: npm run lint
+
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: starter/frontend/.nvmrc
+          cache: npm
+          cache-dependency-path: starter/frontend/package-lock.json
+
+      - run: npm ci
+      - run: CI=true npm test
+
+  build:
+    needs: [lint, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Read backend URL
+        run: |
+          aws eks update-kubeconfig --name cluster --region "$AWS_REGION"
+          BACKEND_HOST="$(kubectl get service backend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')"
+          test -n "$BACKEND_HOST"
+          echo "BACKEND_URL=http://$BACKEND_HOST" >> "$GITHUB_ENV"
+        working-directory: .
+
+      - name: Build and push image
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/frontend:${GITHUB_SHA}"
+          docker build --build-arg REACT_APP_MOVIE_API_URL="$BACKEND_URL" --tag "$IMAGE" .
+          docker push "$IMAGE"
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: imranismail/setup-kustomize@v2
+
+      - name: Configure Kubernetes
+        run: aws eks update-kubeconfig --name cluster --region "$AWS_REGION"
+        working-directory: .
+
+      - name: Deploy frontend
+        run: |
+          kustomize edit set image frontend="${{ steps.ecr.outputs.registry }}/frontend:${GITHUB_SHA}"
+          kustomize build | kubectl apply -f -
