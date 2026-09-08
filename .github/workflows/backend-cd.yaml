@@ -88,6 +88,12 @@ jobs:
         run: aws eks update-kubeconfig --name cluster --region "$AWS_REGION"
         working-directory: .
 
+      - name: Verify Kubernetes connection
+        run: |
+          aws sts get-caller-identity
+          kubectl config current-context
+          kubectl get nodes
+
       - name: Deploy backend
         working-directory: starter/backend/k8s
         run: |
