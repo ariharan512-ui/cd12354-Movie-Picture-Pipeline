@@ -85,8 +85,38 @@ jobs:
       - uses: imranismail/setup-kustomize@v2
 
       - name: Configure Kubernetes
-        run: aws eks update-kubeconfig --name cluster --region "$AWS_REGION"
-        working-directory: .
+        run: |
+          mkdir -p ~/.kube
+          cat > ~/.kube/config <<EOF
+          apiVersion: v1
+          clusters:
+          - cluster:
+              certificate-authority-data: ${{ secrets.EKS_CA_DATA }}
+              server: ${{ secrets.EKS_ENDPOINT }}
+            name: cluster
+          contexts:
+          - context:
+              cluster: cluster
+              user: github-action-user
+            name: cluster
+          current-context: cluster
+          kind: Config
+          users:
+          - name: github-action-user
+            user:
+              exec:
+                apiVersion: client.authentication.k8s.io/v1beta1
+                command: aws
+                args:
+                - eks
+                - get-token
+                - --cluster-name
+                - cluster
+                - --region
+                - us-east-1
+          EOF
+
+          kubectl get nodes
 
       - name: Verify Kubernetes connection
         run: |
