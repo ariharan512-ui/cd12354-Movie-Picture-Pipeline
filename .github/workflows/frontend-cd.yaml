@@ -103,10 +103,9 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Update Kubeconfig
+      - name: Configure Kubernetes
         run: |
           mkdir -p ~/.kube
-
           cat > ~/.kube/config <<EOF
           apiVersion: v1
           clusters:
