@@ -1,115 +1,116 @@
-name: Frontend Continuous Deployment
+name: Frontend CD Pipeline
 
 on:
   push:
-    branches: [main]
+    branches: [ "main" ]
     paths:
-      - "starter/frontend/**"
-      - ".github/workflows/frontend-cd.yaml"
+      - 'starter/frontend/**'
+      - '.github/workflows/frontend-cd.yml'
   workflow_dispatch:
 
 env:
   AWS_REGION: us-east-1
-
-defaults:
-  run:
-    working-directory: starter/frontend
+  EKS_CLUSTER_NAME: cluster
+  ECR_REPOSITORY: mp-frontend
 
 jobs:
-  lint:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-
-      - uses: actions/setup-node@v4
-        with:
-          node-version-file: starter/frontend/.nvmrc
-          cache: npm
-          cache-dependency-path: starter/frontend/package-lock.json
-
-      - run: npm ci
-      - run: npm run lint
-
   test:
+    name: Run Tests
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    defaults:
+      run:
+        working-directory: ./starter/frontend
 
-      - uses: actions/setup-node@v4
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version-file: starter/frontend/.nvmrc
-          cache: npm
-          cache-dependency-path: starter/frontend/package-lock.json
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: './starter/frontend/package-lock.json'
 
-      - run: npm ci
-      - run: CI=true npm test
+      - name: Install Dependencies
+        run: npm ci
 
-  build:
-    needs: [lint, test]
+      - name: Run Tests
+        run: CI=true npm test
+
+  build-and-push:
+    name: Build & Push to ECR
+    needs: test
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    defaults:
+      run:
+        working-directory: ./starter/frontend
 
-      - uses: aws-actions/configure-aws-credentials@v4
+    outputs:
+      image_tag: ${{ steps.set-tag.outputs.tag }}
+      ecr_registry: ${{ steps.login-ecr.outputs.registry }}
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - id: ecr
+      - name: Log in to Amazon ECR
+        id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Read backend URL
-        run: |
-          aws eks update-kubeconfig --name cluster --region "$AWS_REGION"
+      - name: Set Image Tag Output
+        id: set-tag
+        run: echo "tag=${{ github.sha }}" >> $GITHUB_OUTPUT
 
-          echo "Waiting for backend LoadBalancer..."
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-          for i in {1..30}; do
-            BACKEND_HOST="$(kubectl get service backend -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || true)"
-
-            if [ -n "$BACKEND_HOST" ]; then
-              echo "Backend hostname: $BACKEND_HOST"
-              echo "BACKEND_URL=http://$BACKEND_HOST" >> "$GITHUB_ENV"
-              exit 0
-            fi
-
-            echo "Attempt $i/30: LoadBalancer is still pending..."
-            sleep 10
-          done
-  
-          echo "ERROR: Backend LoadBalancer was not assigned."
-          kubectl describe service backend
-          exit 1
-
-      - name: Build and push image
-        run: |
-          IMAGE="${{ steps.ecr.outputs.registry }}/frontend:${GITHUB_SHA}"
-          docker build --build-arg REACT_APP_MOVIE_API_URL="$BACKEND_URL" --tag "$IMAGE" .
-          docker push "$IMAGE"
+      - name: Build and Push Docker Image to ECR
+        uses: docker/build-push-action@v5
+        with:
+          context: ./starter/frontend
+          file: ./starter/frontend/Dockerfile
+          push: true
+          build-args: |
+            REACT_APP_MOVIE_API_URL=${{ secrets.REACT_APP_MOVIE_API_URL || 'http://localhost:5000' }}
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:latest
 
   deploy:
-    needs: build
+    name: Deploy to EKS via Kustomize
+    needs: build-and-push
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+    defaults:
+      run:
+        working-directory: ./starter/frontend/k8s
 
-      - uses: aws-actions/configure-aws-credentials@v4
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
         with:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - id: ecr
-        uses: aws-actions/amazon-ecr-login@v2
-
-      - uses: imranismail/setup-kustomize@v2
-
-      - name: Configure Kubernetes
-        run: aws eks update-kubeconfig --name cluster --region "$AWS_REGION"
-        working-directory: .
-
-      - name: Deploy frontend
+      - name: Update Kubeconfig
         run: |
-          kustomize edit set image frontend="${{ steps.ecr.outputs.registry }}/frontend:${GITHUB_SHA}"
-          kustomize build | kubectl apply -f -
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Set up Kustomize
+        uses: imranismail/setup-kustomize@v2
+
+      - name: Deploy Manifests
+        run: |
+          kustomize edit set image frontend=${{ needs.build-and-push.outputs.ecr_registry }}/${{ env.ECR_REPOSITORY }}:${{ needs.build-and-push.outputs.image_tag }}
+          kustomize build . | kubectl apply -f -
